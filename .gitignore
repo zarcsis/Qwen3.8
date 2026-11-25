@@ -1,0 +1,13 @@
+# Project-local Python interpreter and virtual environment
+.python/
+.venv/
+__pycache__/
+*.pyc
+.ruff_cache/
+
+# Downloaded llama.cpp builds and model weights
+runtime/
+models/
+
+# Local overrides
+config.local.toml

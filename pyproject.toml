@@ -1,0 +1,30 @@
+[project]
+name = "qwen-local"
+version = "0.1.0"
+description = "Run Qwen3.8-27B (GGUF, IQ4_XS) locally with llama.cpp"
+readme = "README.md"
+requires-python = ">=3.15,<3.16"
+dependencies = [
+    "httpx>=0.28.1",
+    "huggingface_hub>=2.4.0",
+    "tqdm>=4.67",
+]
+
+[project.scripts]
+qwen = "qwen_local.cli:main"
+
+[build-system]
+requires = ["uv_build>=0.13.10,<0.14"]
+build-backend = "uv_build"
+
+[tool.ruff]
+line-length = 120
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "B", "UP", "SIM", "I"]
+
+[tool.uv]
+required-version = ">=0.13.10"
+# The interpreter lives in ./.python (see scripts/env.ps1). Never download one
+# implicitly into the global uv directory; setup.ps1 installs it explicitly.
+python-downloads = "manual"
