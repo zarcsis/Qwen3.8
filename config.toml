@@ -59,7 +59,7 @@ mtp = false
 mtp_draft_max = 2
 # Thinking depth: "xhigh" (model default, longest), "medium", "low", or "off"
 # (answers without thinking). Chat clients can override it per request.
-reasoning_effort = "medium"
+reasoning_effort = "xhigh"
 # Extra llama-server arguments, e.g. ["--metrics"].
 extra_args = []
 
