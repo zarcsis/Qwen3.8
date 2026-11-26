@@ -194,6 +194,8 @@ def load(path: Path | None = None) -> Config:
     effort = _get(s, "reasoning_effort", str, "server")
     if effort not in REASONING_EFFORTS:
         raise QwenError(f"{CONFIG_FILE}: reasoning_effort must be one of {', '.join(REASONING_EFFORTS)}")
+    if _get(s, "ctx_size", int, "server") < 0:
+        raise QwenError(f"{CONFIG_FILE}: ctx_size must be 0 (automatic) or a number of tokens")
     server = ServerConfig(
         host=_get(s, "host", str, "server"),
         port=_get(s, "port", int, "server"),

@@ -84,6 +84,50 @@ def server_executable(cfg: Config) -> Path:
     return installed.server
 
 
+def _cuda_version(backend: str) -> tuple[int, int] | None:
+    """(13, 5) for "cuda-13.5"; None for other backends."""
+    match = re.fullmatch(r"cuda-(\d+)\.(\d+)", backend)
+    return (int(match.group(1)), int(match.group(2))) if match else None
+
+
+def compatibility_problem(installed: Installed) -> str | None:
+    """Why the installed build does not suit this machine's GPU and driver, or None.
+
+    Matters after a GPU swap: e.g. a CUDA 12.4 build has no native code for RTX 50 cards.
+    """
+    cuda = _cuda_version(installed.backend)
+    if cuda is None:
+        return None
+    gpus = gpu.query_gpus()
+    if not gpus:
+        return f"the installed {installed.backend} build needs an NVIDIA GPU, but none was found"
+    driver = gpu.cuda_driver_version()
+    if driver and cuda > driver:
+        return (
+            f"the installed {installed.backend} build needs a driver that supports CUDA {cuda[0]}.{cuda[1]}; "
+            f"this driver supports {driver[0]}.{driver[1]}"
+        )
+    for g in gpus:
+        if g.compute_cap and not gpu.cuda_builds_natively_for(cuda, g.compute_cap):
+            return (
+                f"the installed {installed.backend} build has no native code for {g.name} "
+                f"(compute capability {g.compute_cap_str})"
+            )
+    return None
+
+
+def list_devices(server: Path) -> list[str]:
+    """Devices llama.cpp can use, as it reports them (e.g. "CUDA0: NVIDIA GeForce RTX 5070 Ti ...")."""
+    try:
+        result = subprocess.run([server, "--list-devices"], capture_output=True, text=True, timeout=60, check=False)
+    except OSError, subprocess.TimeoutExpired:
+        return []
+    lines = [line.strip() for line in (result.stdout + result.stderr).splitlines()]
+    if "Available devices:" not in lines:
+        return []
+    return [line for line in lines[lines.index("Available devices:") + 1 :] if line]
+
+
 def _cuda_assets(release: dict[str, Any]) -> dict[tuple[int, int], dict[str, Any]]:
     pattern = re.compile(rf"^llama-{re.escape(release['tag_name'])}-bin-win-cuda-(\d+)\.(\d+)-x64\.zip$")
     found = {}
@@ -101,8 +145,14 @@ def _plan(release: dict[str, Any], backend: str) -> Plan | None:
     if backend == "cuda" or backend.startswith("cuda-"):
         builds = _cuda_assets(release)
         if backend == "cuda":
+            # The newest build the driver can run that has native code for every GPU present.
             driver = gpu.cuda_driver_version()
-            usable = [v for v in builds if driver is None or v <= driver]
+            caps = [g.compute_cap for g in gpu.query_gpus() if g.compute_cap]
+            usable = [
+                v
+                for v in builds
+                if (driver is None or v <= driver) and all(gpu.cuda_builds_natively_for(v, c) for c in caps)
+            ]
             if not usable:
                 return None
             version = max(usable)
@@ -144,7 +194,16 @@ def find_plan(release: str, backend: str) -> Plan:
                     plan = _plan(rel, backend)
                     if plan is not None:
                         return plan
-    raise QwenError(f"No recent llama.cpp release has a Windows x64 build for backend '{backend}'.")
+    message = f"No recent llama.cpp release has a Windows x64 build for backend '{backend}'."
+    if backend == "cuda":
+        driver = gpu.cuda_driver_version()
+        driver_cuda = f"{driver[0]}.{driver[1]}" if driver else "unknown"
+        cards = ", ".join(f"{g.name} (compute {g.compute_cap_str})" for g in gpu.query_gpus())
+        message += (
+            f" None of its CUDA builds both runs on this driver (CUDA {driver_cuda}) and has native code "
+            f'for {cards}. Update the NVIDIA driver, or set llama_cpp.backend to "vulkan".'
+        )
+    raise QwenError(message)
 
 
 def _download(client: httpx.Client, asset: dict[str, Any], dest: Path) -> None:
@@ -229,8 +288,15 @@ def install(cfg: Config, *, upgrade: bool = False, release: str | None = None, b
 
     installed = read_installed(cfg)
     if installed and not (upgrade or release or backend):
-        print(f"llama.cpp {installed.tag} ({installed.backend}) is installed: {installed.bin_dir}")
-        return installed
+        problem = compatibility_problem(installed)
+        if problem is None:
+            print(f"llama.cpp {installed.tag} ({installed.backend}) is installed: {installed.bin_dir}")
+            return installed
+        if cfg.llama.backend not in ("auto", "cuda"):
+            print(f"warning: {problem}; llama_cpp.backend = {cfg.llama.backend!r} is set explicitly, keeping it.")
+            return installed
+        # The GPU or driver changed since the install: fetch a build that matches them.
+        print(f"llama.cpp: {problem}; installing a matching build.")
 
     plan = find_plan(release or cfg.llama.release, backend or cfg.llama.backend)
     print(f"llama.cpp {plan.tag}, backend {plan.backend}")

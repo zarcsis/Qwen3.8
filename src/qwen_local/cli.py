@@ -9,7 +9,7 @@ from pathlib import Path
 
 import httpx
 
-from qwen_local import QwenError, chat, config, gpu, llama, model, server
+from qwen_local import QwenError, bench, chat, config, gpu, llama, model, server
 from qwen_local.config import Config
 
 GB = 1000**3
@@ -33,20 +33,30 @@ def cmd_doctor(cfg: Config) -> int:
     if not gpus:
         row("NVIDIA", "not found (llama.cpp will run on the CPU)")
     for g in gpus:
-        row(f"[{g.index}]", f"{g.name}, driver {g.driver}")
+        row(f"[{g.index}]", f"{g.name}, compute capability {g.compute_cap_str}, driver {g.driver}")
         row("VRAM", f"{g.total_mib} MiB total, {g.used_mib} MiB used, {g.free_mib} MiB free")
     if cuda := gpu.cuda_driver_version():
         row("CUDA", f"driver supports up to {cuda[0]}.{cuda[1]}")
 
     print("llama.cpp")
+    server_exe = None
     if cfg.llama.server:
+        server_exe = cfg.llama.server
         row("server", f"{cfg.llama.server} (from config)")
     elif installed := llama.read_installed(cfg):
+        server_exe = installed.server
         row("installed", f"{installed.tag} ({installed.backend})")
         row("server", str(installed.server))
+        if problem := llama.compatibility_problem(installed):
+            ok = False
+            row("warning", f"{problem}; run .\\setup.ps1 to install a matching build")
     else:
         ok = False
         row("installed", "no; run: qwen install-llama")
+    if server_exe:
+        devices = llama.list_devices(server_exe)
+        for i, device in enumerate(devices or ["none (CPU only)"]):
+            row("devices" if i == 0 else "", device)
 
     print("Model")
     row("repo", f"{cfg.model.repo}@{cfg.model.revision}")
@@ -114,12 +124,24 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--host")
     p.add_argument("--port", type=int)
-    p.add_argument("--ctx", type=int, dest="ctx_size", help="context window in tokens")
+    p.add_argument("--ctx", type=int, dest="ctx_size", help="context window in tokens; 0 = largest that fits")
     p.add_argument("--gpu-layers", help="layers on the GPU: auto, all, or a number")
     p.add_argument("--vision", action=argparse.BooleanOptionalAction, help="enable image input")
     p.add_argument("--mtp", action=argparse.BooleanOptionalAction, help="speculative decoding with the MTP layer")
     p.add_argument("--effort", choices=config.REASONING_EFFORTS, help="default reasoning effort")
     p.add_argument("--dry-run", action="store_true", help="print the command line and exit")
+
+    p = sub.add_parser("bench", help="measure prompt and generation speed (starts its own server)")
+    p.add_argument(
+        "--profile",
+        action="append",
+        choices=list(bench.PROFILES),
+        help="profile to run; repeat for several (default: all)",
+    )
+    p.add_argument("--runs", type=int, default=3, help="generation runs per profile (default: 3)")
+    p.add_argument("--prompt", default=bench.GENERATION_PROMPT, help="prompt for the generation runs")
+    p.add_argument("--max-tokens", type=int, default=400, help="tokens per generation run (default: 400)")
+    p.add_argument("--ctx", type=int, dest="ctx_size", help="fixed context for every profile (default: config)")
 
     p = sub.add_parser("chat", help="chat with the running server in the terminal")
     p.add_argument("-p", "--prompt", help="ask one question and exit ('-' reads stdin)")
@@ -163,6 +185,16 @@ def main(argv: list[str] | None = None) -> int:
                     extra_args=tuple(a for a in unknown if a != "--"),
                 )
                 return server.serve(cfg, opts, dry_run=args.dry_run)
+            case "bench":
+                profiles = args.profile or list(bench.PROFILES)
+                return bench.run(
+                    cfg,
+                    profiles,
+                    runs=args.runs,
+                    prompt=args.prompt,
+                    max_tokens=args.max_tokens,
+                    ctx_size=args.ctx_size,
+                )
             case "chat":
                 settings = chat.ChatSettings(
                     think=not args.no_think,

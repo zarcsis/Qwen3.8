@@ -26,8 +26,37 @@ class ServeOptions:
     extra_args: tuple[str, ...] = ()
 
 
+# llama-server's automatic fitting accounts for the MTP draft context, but llama-fit-params
+# (used for the memory report) does not accept the speculative-decoding options. The report
+# reserves this much extra instead: the VRAM MTP took in tests, in context-equivalent terms.
+MTP_FIT_ESTIMATE_MIB = 448
+
+
 def _pick[T](override: T | None, default: T) -> T:
     return default if override is None else override
+
+
+def _memory_args(cfg: Config, opts: ServeOptions, *, extra_margin_mib: int = 0) -> list[str]:
+    """Options that decide VRAM use; llama-server and llama-fit-params both get these."""
+    s = cfg.server
+    args = [
+        "--fit-target", str(s.fit_target_mib + extra_margin_mib),
+        "--flash-attn", s.flash_attn,
+        "--cache-type-k", s.cache_type_k,
+        "--cache-type-v", s.cache_type_v,
+        "--parallel", str(s.parallel),
+        "--batch-size", str(s.batch_size),
+        "--ubatch-size", str(s.ubatch_size),
+    ]  # fmt: skip
+    ctx = _pick(opts.ctx_size, s.ctx_size)
+    if ctx > 0:
+        # Without --ctx-size, llama.cpp picks the largest context that fits.
+        args += ["--ctx-size", str(ctx)]
+    gpu_layers = _pick(opts.gpu_layers, s.gpu_layers)
+    if gpu_layers != "auto":
+        # An explicit layer count disables automatic fitting of the layers.
+        args += ["--gpu-layers", gpu_layers]
+    return args
 
 
 def build_command(cfg: Config, opts: ServeOptions) -> list[str]:
@@ -43,14 +72,7 @@ def build_command(cfg: Config, opts: ServeOptions) -> list[str]:
         "--alias", m.alias,
         "--host", _pick(opts.host, s.host),
         "--port", str(_pick(opts.port, s.port)),
-        "--ctx-size", str(_pick(opts.ctx_size, s.ctx_size)),
-        "--fit-target", str(s.fit_target_mib),
-        "--flash-attn", s.flash_attn,
-        "--cache-type-k", s.cache_type_k,
-        "--cache-type-v", s.cache_type_v,
-        "--parallel", str(s.parallel),
-        "--batch-size", str(s.batch_size),
-        "--ubatch-size", str(s.ubatch_size),
+        *_memory_args(cfg, opts),
         "--temp", str(sampling.temperature),
         "--top-p", str(sampling.top_p),
         "--top-k", str(sampling.top_k),
@@ -59,10 +81,6 @@ def build_command(cfg: Config, opts: ServeOptions) -> list[str]:
         "--repeat-penalty", str(sampling.repeat_penalty),
     ]  # fmt: skip
 
-    gpu_layers = _pick(opts.gpu_layers, s.gpu_layers)
-    if gpu_layers != "auto":
-        # An explicit layer count disables automatic fitting of the layers.
-        cmd += ["--gpu-layers", gpu_layers]
     if s.threads > 0:
         cmd += ["--threads", str(s.threads)]
 
@@ -97,14 +115,14 @@ def _port_in_use(host: str, port: int) -> bool:
 
 
 def fit_report(cfg: Config, opts: ServeOptions) -> str | None:
-    """Ask llama.cpp how many layers fit in the free VRAM right now; None if it cannot tell."""
-    s, m = cfg.server, cfg.model
+    """Ask llama.cpp what context and how many layers fit in the free VRAM right now.
+
+    Returns one line for the user, or None if it cannot tell (no NVIDIA GPU, no tool).
+    """
+    m = cfg.model
     gpus = gpu.query_gpus()
     if not gpus or not m.path.is_file():
         return None
-    gpu_layers = _pick(opts.gpu_layers, s.gpu_layers)
-    if gpu_layers != "auto":
-        return f"GPU layers fixed at {gpu_layers} by configuration."
     try:
         exe = llama.server_executable(cfg).with_name("llama-fit-params.exe")
     except QwenError:
@@ -112,41 +130,46 @@ def fit_report(cfg: Config, opts: ServeOptions) -> str | None:
     if not exe.is_file():
         return None
 
-    # The same memory-relevant settings the server gets. llama-fit-params does not accept the
-    # speculative-decoding options, so the MTP draft context is left out of the estimate.
-    cmd = [
-        str(exe),
-        "--model", str(m.path),
-        "--ctx-size", str(_pick(opts.ctx_size, s.ctx_size)),
-        "--fit-target", str(s.fit_target_mib),
-        "--flash-attn", s.flash_attn,
-        "--cache-type-k", s.cache_type_k,
-        "--cache-type-v", s.cache_type_v,
-        "--parallel", str(s.parallel),
-        "--batch-size", str(s.batch_size),
-        "--ubatch-size", str(s.ubatch_size),
-    ]  # fmt: skip
+    mtp = _pick(opts.mtp, cfg.server.mtp)
+    margin = MTP_FIT_ESTIMATE_MIB if mtp else 0
+    cmd = [str(exe), "--model", str(m.path), *_memory_args(cfg, opts, extra_margin_mib=margin)]
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=120, check=False)
     except OSError, subprocess.TimeoutExpired:
         return None
-    match = re.search(r"-ngl (\d+)", result.stdout)
+    ctx = re.search(r"-c (\d+)", result.stdout)
+    layers = re.search(r"-ngl (-?\d+)", result.stdout)
     total = gguf.gpu_layer_count(m.path)
-    if result.returncode != 0 or not match or not total:
+    if result.returncode != 0 or not ctx or not layers or not total:
         return None
 
-    on_gpu = int(match.group(1))
+    on_gpu = int(layers.group(1))
+    on_gpu = total if on_gpu < 0 else on_gpu  # -1 means all layers
     free = max(g.free_mib for g in gpus)
+    # An estimate: llama-server's own fitting tends to settle on a somewhat larger context.
+    where = f"~{int(ctx.group(1))} tokens of context, {free} MiB VRAM free"
     if on_gpu >= total:
-        line = f"all {total} layers fit on the GPU ({free} MiB VRAM free)."
-    else:
-        line = (
-            f"only {on_gpu} of {total} layers fit on the GPU ({free} MiB VRAM free); the rest run on the "
-            "CPU, which is much slower. Close GPU-heavy apps or lower the context size."
-        )
-    if _pick(opts.mtp, s.mtp):
-        line += " MTP needs ~0.6 GB more than this and only speeds things up when that fits too."
-    return line
+        return f"all {total} layers fit on the GPU ({where})."
+    return (
+        f"only {on_gpu} of {total} layers fit on the GPU ({where}); the rest run on the CPU, which is "
+        "much slower. Close GPU-heavy apps or lower the context size."
+    )
+
+
+def build_warning(cfg: Config) -> str | None:
+    """A warning when the installed llama.cpp build does not match the GPU (e.g. after a GPU swap)."""
+    if cfg.llama.server:
+        return None
+    installed = llama.read_installed(cfg)
+    problem = installed and llama.compatibility_problem(installed)
+    if not problem:
+        return None
+    return f"{problem}. llama.cpp may fall back to the CPU or run slowly; run .\\setup.ps1 to fix it."
+
+
+def ensure_port_free(host: str, port: int) -> None:
+    if _port_in_use(host, port):
+        raise QwenError(f"Port {port} is already in use; is the server already running? Use --port to pick another.")
 
 
 def serve(cfg: Config, opts: ServeOptions, *, dry_run: bool = False) -> int:
@@ -157,8 +180,9 @@ def serve(cfg: Config, opts: ServeOptions, *, dry_run: bool = False) -> int:
 
     host = _pick(opts.host, cfg.server.host)
     port = _pick(opts.port, cfg.server.port)
-    if _port_in_use(host, port):
-        raise QwenError(f"Port {port} is already in use; is the server already running? Use --port to pick another.")
+    ensure_port_free(host, port)
+    if warning := build_warning(cfg):
+        print(f"warning: {warning}")
     if report := fit_report(cfg, opts):
         print(f"Memory check: {report}")
     shown_host = "127.0.0.1" if host in ("0.0.0.0", "::") else host

@@ -29,14 +29,20 @@ server = ""
 [server]
 host = "127.0.0.1"
 port = 8080
-# Context window in tokens. The model supports 262144; the KV cache of this hybrid
-# model costs ~34 KiB per token at q8_0, so 32768 tokens need ~1.1 GiB of VRAM.
-ctx_size = 32768
+# Context window in tokens. 0 picks the largest context that fits in the free VRAM with
+# every layer on the GPU, so it adapts to the GPU and to what else is using VRAM: 20-26K
+# tokens on a 16 GB card (RTX 4080, RTX 5070 Ti) with a typical Windows desktop.
+# The model supports up to 262144; the KV cache costs ~34 KiB per token at q8_0.
+# A fixed value larger than what fits pushes layers to the CPU, or worse, makes the driver
+# move VRAM into system RAM, which halves the speed and makes it erratic.
+ctx_size = 0
 # "auto" lets llama.cpp fit as many layers on the GPU as the free VRAM allows
 # (the rest run on the CPU). A number forces that many layers onto the GPU.
 gpu_layers = "auto"
-# VRAM in MiB that automatic fitting leaves free for other programs.
-fit_target_mib = 512
+# VRAM in MiB that automatic fitting leaves free. Windows, browsers and launchers keep
+# allocating VRAM while the server runs; with less than ~1 GiB spare the driver starts
+# swapping the model's memory to system RAM.
+fit_target_mib = 1024
 # KV cache precision: f16, q8_0, q4_0. q8_0 halves memory at negligible quality cost.
 cache_type_k = "q8_0"
 cache_type_v = "q8_0"
@@ -44,17 +50,19 @@ flash_attn = "on"
 # Concurrent request slots; each one keeps its own recurrent state.
 parallel = 1
 batch_size = 2048
-ubatch_size = 512
+# Tokens per GPU step during prompt processing. 256 rather than llama.cpp's 512: on a
+# 16 GB card it frees VRAM for ~7K more tokens of context at ~4% slower prompt processing.
+ubatch_size = 256
 # CPU threads for layers that run on the CPU; 0 lets llama.cpp decide.
 threads = 0
 # Image input; needs the projector (`qwen download --vision`, ~0.9 GB).
 vision = false
 # Keep the projector on the GPU. Off leaves VRAM to the model and encodes images on the CPU.
 mmproj_offload = false
-# Speculative decoding with the model's built-in MTP layer: ~1.6x faster generation
-# (RTX 4080: 65 vs 40 tokens/s), but it needs ~0.6 GB more VRAM. On a 16 GB GPU it
-# only fits with ctx_size = 16384; when VRAM runs out it brings no gain at all.
-# Try it with: .\serve.ps1 --mtp --ctx 16384
+# Speculative decoding with the model's built-in MTP layer: ~1.5x faster generation
+# (RTX 5070 Ti: 70 vs 47 tokens/s), but it takes ~0.5 GiB of VRAM, which the automatic
+# context gives up: on a 16 GB card the context drops to ~13K tokens.
+# Try it with: .\serve.ps1 --mtp
 mtp = false
 mtp_draft_max = 2
 # Thinking depth: "xhigh" (model default, longest), "medium", "low", or "off"
